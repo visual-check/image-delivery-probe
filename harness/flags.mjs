@@ -1,9 +1,11 @@
 // Writes the Chromium arguments Playwright launches headless shell with, read from the running process, so the
-// raw CDP driver starts the same browser. Drops what the raw driver sets itself.
+// raw CDP driver starts the same browser. Drops what the raw driver sets itself. Opens one page, so that under
+// DEBUG=pw:protocol the log holds Playwright's Page.setFontFamilies call for protocol.mjs.
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { chromium } from 'playwright-core'
 
 const browser = await chromium.launch()
+await (await browser.newPage()).close()
 let args = null
 for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
   let cmd

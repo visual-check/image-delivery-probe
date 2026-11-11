@@ -36,10 +36,10 @@ jobs:
           for u in http://snapshot.ubuntu.com/ubuntu/$SNAPSHOT/dists/noble/InRelease https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT/dists/noble/InRelease \
                    https://snapshot.ubuntu.com/ubuntu-ports/$SNAPSHOT/dists/noble/InRelease https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT/dists/noble/main/binary-arm64/Release \
                    https://snapshot.ubuntu.com/ubuntu-ports/$SNAPSHOT/dists/noble/main/binary-arm64/Release; do
-            echo "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$u") $u"
+            echo "$(curl -4 --retry 8 --retry-all-errors --retry-delay 2 -s -o /dev/null -w '%{http_code} %{redirect_url}' "$u") $u"
           done
           for u in http://archive.ubuntu.com/ubuntu/dists/noble-updates/InRelease http://ports.ubuntu.com/ubuntu-ports/dists/noble-updates/InRelease; do
-            echo "$u: $(curl -s "$u" | grep -E '^(Origin|Label|Snapshots):' | tr '\n' ' ')"
+            echo "$u: $(curl -4 --retry 8 --retry-all-errors --retry-delay 2 -s "$u" | grep -E '^(Origin|Label|Snapshots):' | tr '\n' ' ')"
           done
       - name: apt snapshot ways
         run: image/apt-probe.sh "$UBUNTU" "$SNAPSHOT"

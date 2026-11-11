@@ -1,0 +1,9 @@
+{
+  "name": "image-delivery-probe-harness",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.65.0",
+    "pngjs": "7.0.0"
+  }
+}
