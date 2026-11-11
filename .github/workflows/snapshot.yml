@@ -1,0 +1,45 @@
+# apt pinned to an Ubuntu snapshot, per arch: builds the base stage only (nothing pushed) in each way, in order, and
+# records which pin every package index to snapshot.ubuntu.com.
+name: snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: Ubuntu snapshot ID for apt
+        default: 20261110T000000Z
+
+permissions: {}
+
+jobs:
+  attempts:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Builder
+        run: |
+          docker buildx create --name probe --driver docker-container --bootstrap
+          image/hosts.sh | tee hosts.txt
+      - name: Ways
+        env:
+          SNAPSHOT: ${{ inputs.snapshot }}
+          ALL_WAYS: "1"
+        run: |
+          mkdir -p out
+          mapfile -t ADD < hosts.txt
+          image/snapshot-attempts.sh "$SNAPSHOT" "out/snapshot-$(uname -m).json" "${ADD[@]}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: snapshot-${{ matrix.runner }}
+          path: out/
+          retention-days: 30

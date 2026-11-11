@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds the base stage with apt pinned to the snapshot in several ways, in order, and keeps the first that works.
-# The last way is unpinned, so a build always comes out. Writes what each way did to <out json>.
+# The last way is unpinned, so a build always comes out. Writes what each way did to <out json>. ALL_WAYS=1 tries all.
 #   snapshot-attempts.sh <snapshot id> <out json> [--add-host flags...]
 set -uo pipefail
 ID=$1; OUT=$2; shift 2
@@ -46,7 +46,9 @@ for w in "${ways[@]}"; do
   echo "exit $rc"
   jq --arg n "$name" --arg s "$snap" --arg o "$opts" --arg c "$ca" --argjson rc "$rc" --rawfile b "/tmp/attempt-$name.brief" \
     '. + [{name: $n, snapshot: $s, aptOpts: $o, caFirst: $c, ok: ($rc == 0), exit: $rc, log: $b}]' "$OUT.tmp" > "$OUT.tmp2" && mv "$OUT.tmp2" "$OUT.tmp"
-  if [ $rc = 0 ]; then chosen=$name; break; fi
+  [ $rc = 0 ] && [ -z "$chosen" ] && chosen=$name
+  # ALL_WAYS=1 tries every way, to record each; the first that worked stays the chosen one
+  [ $rc = 0 ] && [ "${ALL_WAYS:-0}" != 1 ] && break
 done
 jq --arg id "$ID" --arg arch "$ARCH" --arg chosen "$chosen" --argjson reach "$reachable" \
   '{snapshot: $id, arch: $arch, serviceReachable: $reach, pinned: ($chosen != "unpinned" and $chosen != ""), chosen: $chosen, attempts: .,
