@@ -37,6 +37,9 @@ jobs:
           mkdir -p out
           mapfile -t ADD < hosts.txt
           image/snapshot-attempts.sh "$SNAPSHOT" "out/snapshot-$(uname -m).json" "${ADD[@]}"
+      - name: Keep full build logs
+        if: always()
+        run: mkdir -p out/logs && cp /tmp/attempt-*.log out/logs/ 2>/dev/null || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
