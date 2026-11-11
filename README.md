@@ -10,6 +10,9 @@ delivering it, and whether a slim image renders the same pixels as Playwright's 
   records sizes and fonts, and saves cache entries.
 - `.github/workflows/delivery.yml`: time to a runnable browser per delivery option, 8 shards per runner image.
 - `.github/workflows/pixels.yml`: the same 300 stories captured in each image, hashes and pixel deltas compared.
+- `.github/workflows/network.yml`: for visual-check#47, a browser container started through the Docker socket mounted
+  into a job container on another image, tried on the runner's network, through the proxy and joining the job
+  container's network; and the SOCKS proxy's cost against host networking on 300 stories.
 - `.github/workflows/windows.yml`: Docker Desktop on `windows-2025`: the browser from the image, from a bind mount of a
   Windows folder, or from a named volume. Time to the first CDP reply, and captures per second.
 

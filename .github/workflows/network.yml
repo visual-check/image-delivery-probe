@@ -1,0 +1,130 @@
+# Network paths for visual-check#47: a browser started through a mounted Docker socket from a job container on another
+# image, and the SOCKS proxy's cost against host networking on runners.
+name: network
+
+on:
+  workflow_dispatch:
+    inputs:
+      prepare_run:
+        description: Run ID of the prepare workflow (storybook and meta artifacts)
+        required: true
+
+permissions: {}
+
+jobs:
+  socket:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    container:
+      image: node:24-bookworm
+      options: --add-host sb.vc.test:127.0.0.1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: jq and the docker CLI (no daemon)
+        run: |
+          apt-get update -qq && apt-get install -y -qq jq > /dev/null
+          v=$(curl -fsSL https://download.docker.com/linux/static/stable/x86_64/ | grep -oE 'docker-[0-9]+\.[0-9]+\.[0-9]+\.tgz' | sort -V | tail -1)
+          curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/$v" | tar -xz -C /usr/local/bin --strip-components=1 docker/docker
+          docker --version
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - name: Unpack, install the harness (JS only) and pull the image
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          (cd sb && sha256sum -c storybook.tar.sha256) && tar -C sb -xf sb/storybook.tar
+          (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
+          img=$(jq -r '.images["full-gzip"]' meta/pins.json)
+          docker pull -q "$img" || { echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin && docker pull -q "$img"; }
+      - name: Ways into the job container
+        env:
+          JOB_CONTAINER_ID: ${{ job.container.id }}
+          JOB_NETWORK: ${{ job.container.network }}
+        run: bash harness/socket.sh "$PWD/sb/storybook-static" "$PWD/out/socket"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: network-socket
+          path: out/
+          retention-days: 30
+
+  cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - name: Unpack, install the harness (JS only) and pull the image
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          (cd sb && sha256sum -c storybook.tar.sha256) && tar -C sb -xf sb/storybook.tar
+          (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
+          img=$(jq -r '.images["full-gzip"]' meta/pins.json)
+          docker pull -q "$img" || { echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin && docker pull -q "$img"; }
+      - name: Proxy against host networking
+        run: harness/proxy-cost.sh $(( ${{ matrix.job }} - 1 )) "$PWD/sb/storybook-static" "$PWD/out/job${{ matrix.job }}" 3
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: network-cost-job${{ matrix.job }}
+          path: out/
+          retention-days: 30
+
+  summary:
+    needs: [socket, cost]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: network-*
+          path: art
+      - name: Summarise
+        run: node harness/network-summary.mjs art | tee -a "$GITHUB_STEP_SUMMARY"
