@@ -32,10 +32,12 @@ clean() {
 }
 # First reply twice: cold (just delivered) and warm (page cache filled by the first start)
 replies() {
-  local img=$1 exe=$2 d=$3 a b
+  local img=$1 exe=$2 d=$3 a b dirty
+  # Dirty and writeback page cache (kB) right before the first start: what unzip or load left to flush
+  dirty=$(awk '/^(Dirty|Writeback):/ {sub(":", "", $1); printf "%s\"%s\": %s", (n++ ? ", " : ""), $1, $2}' /proc/meminfo)
   a=$(node "$H/first-reply.mjs" "$(docker_argv "$BARGS" "$img" "$exe" "$d" '[]')")
   b=$(node "$H/first-reply.mjs" "$(docker_argv "$BARGS" "$img" "$exe" "$d" '[]')")
-  jq -cn --argjson a "$a" --argjson b "$b" '{first: $a, warm: $b}'
+  jq -cn --argjson a "$a" --argjson b "$b" --argjson dirty "{$dirty}" '{first: $a, warm: $b, pageCacheKb: $dirty}'
 }
 NET='["--network", "host", "--pull", "never"]'
 MOUNT() { jq -cn --arg w "$W/chs" '["--network", "host", "--pull", "never", "-v", "\($w):/opt/chrome-headless-shell:ro"]'; }
