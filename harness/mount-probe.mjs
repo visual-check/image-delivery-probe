@@ -67,7 +67,14 @@ const firstReply = (v) => {
 
 record({ kind: 'runtime', info: run(['info', '--format', '{{.ServerVersion}} | {{.OperatingSystem}} | {{.KernelVersion}} | {{.NCPU}} CPUs | {{.MemTotal}} | {{.Driver}}']).stdout.trim() })
 if (o.pull) {
-  for (const [name, ref] of [['full-gzip', full], ['base-gzip', base], ['helper', HELPER]]) record({ kind: 'pull', image: name, s: run(['pull', '-q', ...plat, ref]).s })
+  // Each image alone into an empty store, then base again on top of full (shared layers), then the helper
+  const prune = () => run(['system', 'prune', '-af'])
+  prune()
+  record({ kind: 'pull', image: 'base-gzip', alone: true, s: run(['pull', '-q', ...plat, base]).s })
+  prune()
+  record({ kind: 'pull', image: 'full-gzip', alone: true, s: run(['pull', '-q', ...plat, full]).s })
+  record({ kind: 'pull', image: 'base-gzip', alone: false, s: run(['pull', '-q', ...plat, base]).s })
+  record({ kind: 'pull', image: 'helper', s: run(['pull', '-q', ...plat, HELPER]).s })
 }
 // Volume: a fresh one, filled from the zip streamed over stdin, so no host path is shared
 spawnSync(docker[0], [...docker.slice(1), 'volume', 'rm', '-f', o.volume])
