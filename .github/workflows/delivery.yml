@@ -1,0 +1,109 @@
+# Time to a runnable browser on a fresh runner, 8 shards per runner image starting together, per delivery option.
+name: delivery
+
+on:
+  workflow_dispatch:
+    inputs:
+      prepare_run:
+        description: Run ID of the prepare workflow (artifacts and cache keys)
+        required: true
+
+permissions: {}
+
+jobs:
+  measure:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - name: Machine
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          harness/delivery.sh machine
+          # GHCR packages that aren't public need a login; done here, outside every timing
+          if ! docker buildx imagetools inspect "$(jq -r '.images["full-gzip"]' meta/pins.json)" > /dev/null 2>&1; then
+            echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin && echo authenticated > out/ghcr-auth.txt
+          else
+            echo anonymous > out/ghcr-auth.txt
+          fi
+      - name: Pull variants (a-e)
+        run: harness/delivery.sh pulls "$SHARD"
+
+      - id: c1
+        name: Cache slot 1
+        run: harness/delivery.sh cache-before 1 "$SHARD"
+      - uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.c1.outputs.key1 }}
+          path: ${{ steps.c1.outputs.path1 }}
+          fail-on-cache-miss: true
+      - run: harness/delivery.sh cache-mid
+      - if: steps.c1.outputs.key2 != ''
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.c1.outputs.key2 }}
+          path: ${{ steps.c1.outputs.path2 }}
+          fail-on-cache-miss: true
+      - run: harness/delivery.sh cache-after
+
+      - id: c2
+        name: Cache slot 2
+        run: harness/delivery.sh cache-before 2 "$SHARD"
+      - uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.c2.outputs.key1 }}
+          path: ${{ steps.c2.outputs.path1 }}
+          fail-on-cache-miss: true
+      - run: harness/delivery.sh cache-mid
+      - if: steps.c2.outputs.key2 != ''
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.c2.outputs.key2 }}
+          path: ${{ steps.c2.outputs.path2 }}
+          fail-on-cache-miss: true
+      - run: harness/delivery.sh cache-after
+
+      - id: c3
+        name: Cache slot 3
+        run: harness/delivery.sh cache-before 3 "$SHARD"
+      - uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.c3.outputs.key1 }}
+          path: ${{ steps.c3.outputs.path1 }}
+          fail-on-cache-miss: true
+      - run: harness/delivery.sh cache-mid
+      - if: steps.c3.outputs.key2 != ''
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.c3.outputs.key2 }}
+          path: ${{ steps.c3.outputs.path2 }}
+          fail-on-cache-miss: true
+      - run: harness/delivery.sh cache-after
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: delivery-${{ matrix.runner }}-${{ matrix.shard }}
+          path: out/
+          retention-days: 30

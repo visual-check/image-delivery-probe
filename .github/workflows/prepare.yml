@@ -1,0 +1,300 @@
+# Builds everything the delivery and pixels runs use: a HeroUI Storybook, the slim images (pushed with gzip and with
+# zstd layers), Playwright's Chromium arguments and font table, and cache entries for the cache variants.
+name: prepare
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: Ubuntu snapshot ID for apt
+        default: 20261110T000000Z
+
+permissions: {}
+
+env:
+  UBUNTU: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+  PLAYWRIGHT: mcr.microsoft.com/playwright@sha256:6e3fb709361521eb27161606e6da6d2674e5e89fa16516cb37d6fdd91372273d
+  CHROMIUM: 158.0.8127.18
+  REPO_IMG: ghcr.io/${{ github.repository }}
+  HEROUI_SHA: b2c65a5b5236550526f23d475b1ad0c6e5eab1a2
+
+jobs:
+  storybook:
+    # Third-party install and build scripts run here: no token permissions and no checkout of this repo.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions: {}
+    env:
+      STORYBOOK_DISABLE_TELEMETRY: 1
+      TURBO_TELEMETRY_DISABLED: 1
+      DO_NOT_TRACK: 1
+    steps:
+      - name: Fetch HeroUI at the pinned commit
+        run: |
+          git init -q heroui
+          git -C heroui fetch -q --depth 1 https://github.com/heroui-inc/heroui "$HEROUI_SHA"
+          git -C heroui checkout -q FETCH_HEAD
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: heroui/.nvmrc
+      - run: npm install -g pnpm@10.34.7
+      - name: Install
+        working-directory: heroui
+        run: pnpm install --frozen-lockfile
+      - name: Build Storybook
+        working-directory: heroui
+        run: pnpm build:storybook
+      - name: Pack
+        run: |
+          mkdir out
+          tar -C heroui/packages/storybook -cf out/storybook.tar storybook-static
+          (cd out && sha256sum storybook.tar | tee storybook.tar.sha256)
+          jq '[.entries[] | select(.type == "story")] | length' heroui/packages/storybook/storybook-static/index.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: storybook
+          path: out/
+          retention-days: 30
+
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Resolve pins
+        run: |
+          mkdir -p meta cft
+          docker buildx imagetools inspect ubuntu:24.04 | tee meta/ubuntu-current.txt
+          docker buildx imagetools inspect "$PLAYWRIGHT" | tee meta/playwright-index.txt
+          docker buildx imagetools inspect --raw "$PLAYWRIGHT" | jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest' > meta/playwright-amd64.txt
+          url=https://storage.googleapis.com/chrome-for-testing-public/$CHROMIUM/linux64/chrome-headless-shell-linux64.zip
+          curl -fsSL --retry 3 -o cft/chrome-headless-shell-linux64.zip "$url"
+          (cd cft && sha256sum chrome-headless-shell-linux64.zip | tee ../meta/cft-linux64.sha256)
+          ls -l cft
+          unzip -l cft/chrome-headless-shell-linux64.zip | head -8
+      - name: Builder
+        run: |
+          docker buildx create --name probe --driver docker-container --bootstrap
+          docker buildx inspect probe | head -12
+          image/hosts.sh | tee hosts.txt
+      - name: Pin apt to the snapshot (first way that works)
+        env:
+          SNAPSHOT: ${{ inputs.snapshot }}
+        run: |
+          mapfile -t ADD < hosts.txt
+          image/snapshot-attempts.sh "$SNAPSHOT" meta/snapshot-amd64.json "${ADD[@]}"
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push base and full, gzip and zstd layers
+        run: |
+          mapfile -t ADD < hosts.txt
+          mapfile -t BA < <(jq -r '.buildArgs | to_entries[] | "--build-arg=\(.key)=\(.value)"' meta/snapshot-amd64.json)
+          for t in base full; do
+            for c in gzip zstd; do
+              docker buildx build --builder probe --platform linux/amd64 --target "$t" "${ADD[@]}" "${BA[@]}" \
+                --build-context cft=cft --build-arg CFT_ZIP=chrome-headless-shell-linux64.zip \
+                --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" --provenance=false --sbom=false \
+                --output "type=registry,name=$REPO_IMG/$t:$c,compression=$c,force-compression=true,oci-mediatypes=true" \
+                --metadata-file "meta/build-$t-$c.json" image
+              echo "$t-$c $(jq -r '."containerimage.digest"' "meta/build-$t-$c.json")"
+            done
+          done
+      - name: Pins file
+        run: |
+          pw_exe=$(docker run --rm "$PLAYWRIGHT" sh -c 'ls -d /ms-playwright/chromium_headless_shell-*/chrome-headless-shell-*/chrome-headless-shell')
+          img() { echo "$REPO_IMG/$1@$(jq -r '."containerimage.digest"' "meta/build-$1.json")"; }
+          jq -n --arg ubuntu "$UBUNTU" --arg pw "$PLAYWRIGHT" --arg pwa "$(cat meta/playwright-amd64.txt)" --arg pwe "$pw_exe" \
+            --arg exe /opt/chrome-headless-shell/chrome-headless-shell-linux64/chrome-headless-shell \
+            --arg url "https://storage.googleapis.com/chrome-for-testing-public/$CHROMIUM/linux64/chrome-headless-shell-linux64.zip" \
+            --arg sha "$(cut -d' ' -f1 meta/cft-linux64.sha256)" --arg run "$GITHUB_RUN_ID" \
+            --arg bg "$(img base-gzip)" --arg bz "$(img base-zstd)" --arg fg "$(img full-gzip)" --arg fz "$(img full-zstd)" \
+            --slurpfile snap meta/snapshot-amd64.json \
+            '{ubuntu: $ubuntu, playwright: $pw, playwrightAmd64: $pwa, playwrightExe: $pwe, ourExe: $exe, cftUrl: $url, cftSha256: $sha,
+              prepareRun: $run, images: {"base-gzip": $bg, "base-zstd": $bz, "full-gzip": $fg, "full-zstd": $fz},
+              snapshot: ($snap[0] | {snapshot, pinned, chosen})}' | tee meta/pins.json
+      - name: Sizes
+        run: |
+          compressed() { docker buildx imagetools inspect --raw "$1" | jq '[.layers[].size] | add'; }
+          pull_size() { docker pull -q "$1" > /dev/null; docker image inspect -f '{{.Size}}' "$1"; }
+          pw="${PLAYWRIGHT%@*}@$(jq -r .playwrightAmd64 meta/pins.json)"
+          {
+            echo "{\"image\": \"playwright\", \"ref\": \"$pw\", \"compressed\": $(compressed "$pw"), \"layers\": $(docker buildx imagetools inspect --raw "$pw" | jq '.layers | length'), \"unpacked\": $(pull_size "$PLAYWRIGHT")}"
+            for k in base-gzip base-zstd full-gzip full-zstd; do
+              ref=$(jq -r ".images[\"$k\"]" meta/pins.json)
+              echo "{\"image\": \"$k\", \"ref\": \"$ref\", \"compressed\": $(compressed "$ref"), \"layers\": $(docker buildx imagetools inspect --raw "$ref" | jq '.layers | length'), \"mediaTypes\": $(docker buildx imagetools inspect --raw "$ref" | jq -c '[.layers[].mediaType] | unique'), \"unpacked\": $(pull_size "$ref")}"
+            done
+          } | jq -s . | tee meta/sizes.json
+          echo "CfT zip: $(stat -c %s cft/chrome-headless-shell-linux64.zip) bytes, unpacked $(unzip -l cft/chrome-headless-shell-linux64.zip | tail -1)"
+          docker info --format '{{.ServerVersion}} {{.Driver}} {{json .DriverStatus}}'
+      - name: Libraries, marker and fonts
+        run: |
+          full=$(jq -r '.images["full-gzip"]' meta/pins.json)
+          exe=$(jq -r .ourExe meta/pins.json)
+          docker run --rm "$full" sh -c "ldd $exe | grep 'not found' && exit 1 || echo 'ldd: nothing missing'; cat /etc/visual-check/image.json; ls /opt/chrome-headless-shell/*"
+          fonts='fc-list | sort; for f in serif sans-serif monospace cursive fantasy Arial "Times New Roman" "Comic Sans MS" Impact; do echo "fc-match $f: $(fc-match "$f")"; done; dpkg-query -W | grep -iE "font|dejavu" '
+          docker run --rm "$PLAYWRIGHT" sh -c "$fonts" > meta/fc-playwright.txt 2>&1
+          docker run --rm "$full" sh -c "$fonts" > meta/fc-ours.txt 2>&1
+          grep fc-match meta/fc-playwright.txt meta/fc-ours.txt
+          diff <(grep -v '^fc-match' meta/fc-playwright.txt | grep -v 'ii\|^[a-z0-9.+-]*\s' ) <(grep -v '^fc-match' meta/fc-ours.txt | grep -v '^[a-z0-9.+-]*\s') && echo "fc-list: same" || true
+          docker run --rm "$full" dpkg-query -W > meta/dpkg-ours.txt
+          docker run --rm "$PLAYWRIGHT" dpkg-query -W > meta/dpkg-playwright.txt
+          wc -l meta/dpkg-*.txt
+      - name: Playwright's Chromium arguments and font table
+        run: |
+          (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
+          docker run --rm --init --ipc=host -v "$PWD/harness:/h:ro" -v "$PWD/meta:/out" "$PLAYWRIGHT" \
+            sh -c 'DEBUG=pw:protocol node /h/flags.mjs /out/flags.json 2> /tmp/proto.log; node /h/protocol.mjs /tmp/proto.log /out/fonts.json /out/protocol-audit.json'
+          jq -e 'index("--no-sandbox")' meta/flags.json > /dev/null && echo "--no-sandbox present"
+          jq '. + ["--disable-skia-runtime-opts"]' meta/flags.json > meta/browser-args.json
+          cat meta/browser-args.json meta/fonts.json
+      - name: First reply in each image
+        run: |
+          . harness/lib.sh
+          mkdir -p chs && unzip -q cft/chrome-headless-shell-linux64.zip -d chs
+          net='["--network", "host", "--pull", "never"]'
+          mnt=$(jq -cn --arg w "$PWD/chs" '["--network", "host", "--pull", "never", "-v", "\($w):/opt/chrome-headless-shell:ro"]')
+          node harness/first-reply.mjs "$(docker_argv meta/browser-args.json "$PLAYWRIGHT" "$(jq -r .playwrightExe meta/pins.json)" "$net" '[]')"
+          node harness/first-reply.mjs "$(docker_argv meta/browser-args.json "$(jq -r '.images["full-gzip"]' meta/pins.json)" "$(jq -r .ourExe meta/pins.json)" "$net" '[]')"
+          node harness/first-reply.mjs "$(docker_argv meta/browser-args.json "$(jq -r '.images["base-gzip"]' meta/pins.json)" "$(jq -r .ourExe meta/pins.json)" "$mnt" '[]')"
+      - name: Package visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for p in base full; do
+            gh api "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${GITHUB_REPOSITORY#*/}%2F$p" --jq '{name, visibility, repository: .repository.full_name}' 2>&1 | tee -a meta/visibility.txt || true
+            echo "anonymous pull of $p: $(docker logout ghcr.io > /dev/null; docker buildx imagetools inspect "$(jq -r ".images[\"$p-gzip\"]" meta/pins.json)" > /dev/null 2>&1 && echo yes || echo no)" | tee -a meta/visibility.txt
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: meta
+          path: meta/
+          retention-days: 30
+
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: CfT zip and builder
+        run: |
+          mkdir -p meta cft
+          url=https://storage.googleapis.com/chrome-for-testing-public/$CHROMIUM/linux-arm64/chrome-headless-shell-linux-arm64.zip
+          curl -fsSL --retry 3 -o cft/chrome-headless-shell-linux-arm64.zip "$url"
+          (cd cft && sha256sum chrome-headless-shell-linux-arm64.zip | tee ../meta/cft-linux-arm64.sha256)
+          unzip -l cft/chrome-headless-shell-linux-arm64.zip | head -6
+          docker buildx create --name probe --driver docker-container --bootstrap
+          image/hosts.sh | tee hosts.txt
+      - name: Pin apt to the snapshot (first way that works)
+        env:
+          SNAPSHOT: ${{ inputs.snapshot }}
+        run: |
+          mapfile -t ADD < hosts.txt
+          image/snapshot-attempts.sh "$SNAPSHOT" meta/snapshot-arm64.json "${ADD[@]}"
+      - name: Build full for arm64 (not pushed)
+        run: |
+          mapfile -t ADD < hosts.txt
+          mapfile -t BA < <(jq -r '.buildArgs | to_entries[] | "--build-arg=\(.key)=\(.value)"' meta/snapshot-arm64.json)
+          for t in base full; do
+            docker buildx build --builder probe --platform linux/arm64 --target "$t" "${ADD[@]}" "${BA[@]}" \
+              --build-context cft=cft --build-arg CFT_ZIP=chrome-headless-shell-linux-arm64.zip --provenance=false --sbom=false \
+              --output "type=docker,name=probe/$t:arm64" image
+            echo "{\"image\": \"$t-arm64\", \"unpacked\": $(docker image inspect -f '{{.Size}}' "probe/$t:arm64")}" >> meta/sizes-arm64.jsonl
+          done
+          cat meta/sizes-arm64.jsonl
+          exe=$(docker run --rm probe/full:arm64 sh -c 'ls -d /opt/chrome-headless-shell/*/chrome-headless-shell')
+          docker run --rm probe/full:arm64 sh -c "cat /etc/visual-check/image.json; ldd $exe | grep 'not found' || echo 'ldd: nothing missing'"
+          . harness/lib.sh
+          echo '["--no-sandbox", "--headless", "--disable-skia-runtime-opts"]' > args.json
+          node harness/first-reply.mjs "$(docker_argv args.json probe/full:arm64 "$exe" '["--network", "host"]' '[]')" | tee meta/first-reply-arm64.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: meta-arm64
+          path: meta/
+          retention-days: 30
+
+  cache:
+    # Cache entries on main for the delivery runs' cache variants: docker save tars and the CfT zip.
+    needs: images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+      - name: Images to tars
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          . harness/lib.sh
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          mkdir -p vc-cache
+          for x in "playwright:$PLAYWRIGHT" "full:$(jq -r '.images["full-gzip"]' meta/pins.json)" "base:$(jq -r '.images["base-gzip"]' meta/pins.json)"; do
+            n=${x%%:*}; ref=${x#*:}
+            docker pull -q "$ref" && docker tag "$ref" "vc-probe/$n:cached"
+            t0=$(now); docker save -o "vc-cache/$([ "$n" = playwright ] && echo pw || echo "$n").tar" "vc-probe/$n:cached"; t1=$(now)
+            echo "{\"entry\": \"$n-tar\", \"dockerSaveS\": $(since "$t0" "$t1")}" >> times.jsonl
+          done
+          curl -fsSL --retry 3 -o vc-cache/chs.zip "$(jq -r .cftUrl meta/pins.json)"
+          echo "$(jq -r .cftSha256 meta/pins.json)  vc-cache/chs.zip" | sha256sum -c
+          ls -l vc-cache | tee files.txt
+          docker info --format '{{.ServerVersion}} {{.Driver}}'
+          now > t0
+      - uses: actions/cache/save@v6
+        with:
+          key: vc-probe-pw-tar-${{ github.run_id }}
+          path: vc-cache/pw.tar
+      - run: now() { date +%s.%N; }; now > t1
+      - uses: actions/cache/save@v6
+        with:
+          key: vc-probe-full-tar-${{ github.run_id }}
+          path: vc-cache/full.tar
+      - run: now() { date +%s.%N; }; now > t2
+      - uses: actions/cache/save@v6
+        with:
+          key: vc-probe-base-tar-${{ github.run_id }}
+          path: vc-cache/base.tar
+      - run: now() { date +%s.%N; }; now > t3
+      - uses: actions/cache/save@v6
+        with:
+          key: vc-probe-cft-zip-${{ github.run_id }}
+          path: vc-cache/chs.zip
+      - name: Record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . harness/lib.sh
+          t4=$(now)
+          mkdir -p cache-meta
+          s() { since "$(cat "$1")" "$2"; }
+          entries=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --jq "[.actions_caches[] | select(.key | endswith(\"-$GITHUB_RUN_ID\")) | {key, size: .size_in_bytes, version}]")
+          jq -n --slurpfile d times.jsonl --argjson e "$entries" --rawfile files files.txt \
+            --arg pw "$(s t0 "$(cat t1)")" --arg full "$(s t1 "$(cat t2)")" --arg base "$(s t2 "$(cat t3)")" --arg zip "$(s t3 "$t4")" \
+            '{dockerSave: $d, saveStepS: {"pw-tar": ($pw | tonumber), "full-tar": ($full | tonumber), "base-tar": ($base | tonumber), "cft-zip": ($zip | tonumber)},
+              entries: $e, files: $files}' | tee cache-meta/cache.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cache-meta
+          path: cache-meta/
+          retention-days: 30

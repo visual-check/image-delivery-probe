@@ -1,0 +1,83 @@
+# Docker Desktop (WSL2 backend, Linux containers) on windows-2025: the browser from the full image, from base with
+# the CfT folder bind-mounted from Windows, and from base with a named volume. Time to first CDP reply, and captures.
+name: windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      prepare_run:
+        description: Run ID of the prepare workflow (storybook and meta artifacts)
+        required: true
+
+permissions: {}
+
+jobs:
+  docker-desktop:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - name: Unpack and install the harness (JS only)
+        run: |
+          tar -C sb -xf sb/storybook.tar
+          Push-Location harness; npm ci --ignore-scripts --no-audit --no-fund; Pop-Location
+          New-Item -ItemType Directory -Force out | Out-Null
+      - name: Docker Desktop
+        timeout-minutes: 30
+        run: harness/docker-desktop-windows.ps1 *>&1 | Tee-Object out/docker-desktop.txt
+      - name: CfT zip into a Windows folder
+        run: |
+          $pins = Get-Content meta/pins.json | ConvertFrom-Json
+          $dir = "$env:LOCALAPPDATA\vc-probe"; New-Item -ItemType Directory -Force $dir | Out-Null
+          $t = [Diagnostics.Stopwatch]::StartNew()
+          curl.exe -fsSL --retry 3 -o "$dir\chs.zip" $pins.cftUrl
+          $dl = $t.Elapsed.TotalSeconds; $t.Restart()
+          $sha = (Get-FileHash "$dir\chs.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $pins.cftSha256) { throw "sha256 $sha" }
+          $hs = $t.Elapsed.TotalSeconds; $t.Restart()
+          New-Item -ItemType Directory -Force "$dir\chs" | Out-Null
+          tar.exe -xf "$dir\chs.zip" -C "$dir\chs"
+          $uz = $t.Elapsed.TotalSeconds
+          "{`"host`":`"windows-2025`",`"kind`":`"cft-zip`",`"downloadS`":$([math]::Round($dl,3)),`"sha256S`":$([math]::Round($hs,3)),`"unzipS`":$([math]::Round($uz,3)),`"unzip`":`"tar.exe -xf (bsdtar)`"}" | Tee-Object -Append out/mount.jsonl
+          "CHS_DIR=$dir" | Out-File -Append $env:GITHUB_ENV
+      - name: First replies and captures
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          $cli = 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
+          $pins = Get-Content meta/pins.json | ConvertFrom-Json
+          & $cli --context desktop-linux buildx imagetools inspect $pins.images.'full-gzip' *> $null
+          if ($LASTEXITCODE) { $env:TOKEN | & $cli --context desktop-linux login ghcr.io -u $env:GITHUB_ACTOR --password-stdin }
+          $docker = ConvertTo-Json -Compress @($cli, '--context', 'desktop-linux')
+          node harness/mount-probe.mjs --docker $docker --host windows-2025 --zip "$env:CHS_DIR\chs.zip" --chs "$env:CHS_DIR\chs" `
+            --out out/mount.jsonl --passes 3 --pull --drop-caches --platform linux/amd64 --capture a,b --storybook sb/storybook-static --pngs out/pngs
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-docker-desktop
+          path: out/
+          retention-days: 30

@@ -1,0 +1,94 @@
+# Pixel parity: the same 300 stories in Playwright's image, full, and base with the CfT zip bind-mounted.
+name: pixels
+
+on:
+  workflow_dispatch:
+    inputs:
+      prepare_run:
+        description: Run ID of the prepare workflow (storybook and meta artifacts)
+        required: true
+
+permissions: {}
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ inputs.prepare_run }}
+          github-token: ${{ github.token }}
+      - name: Unpack and install the harness (JS only)
+        run: |
+          (cd sb && sha256sum -c storybook.tar.sha256) && tar -C sb -xf sb/storybook.tar
+          (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
+      - name: Images and CfT folder
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          docker buildx imagetools inspect "$(jq -r '.images["full-gzip"]' meta/pins.json)" > /dev/null 2>&1 \
+            || echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          for r in "$(jq -r .playwright meta/pins.json)" "$(jq -r '.images["full-gzip"]' meta/pins.json)" "$(jq -r '.images["base-gzip"]' meta/pins.json)"; do docker pull -q "$r"; done
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/chs.zip" "$(jq -r .cftUrl meta/pins.json)"
+          echo "$(jq -r .cftSha256 meta/pins.json)  $RUNNER_TEMP/chs.zip" | sha256sum -c
+          unzip -q "$RUNNER_TEMP/chs.zip" -d "$RUNNER_TEMP/chs"
+          nproc; lscpu | grep 'Model name'
+      - name: Capture
+        run: harness/pixels.sh $(( ${{ matrix.job }} - 1 )) "$PWD/sb/storybook-static" "$PWD/out/job${{ matrix.job }}" "$RUNNER_TEMP/chs" 2
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pixels-job${{ matrix.job }}
+          path: out/
+          retention-days: 30
+
+  compare:
+    needs: capture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cd harness && npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pixels-job*
+          path: art
+      - name: Compare
+        run: |
+          mkdir -p cmp
+          node harness/compare.mjs cmp/compare.json art/pixels-job*/job* | tee cmp/summary.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compare
+          path: cmp/
+          retention-days: 30
