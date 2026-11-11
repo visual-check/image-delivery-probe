@@ -1,0 +1,45 @@
+# Quick look before the real runs: runner labels, Docker setup, and how apt snapshot pinning behaves per arch.
+name: explore
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  UBUNTU: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+  SNAPSHOT: 20261110T000000Z
+
+jobs:
+  look:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Machine
+        run: |
+          uname -a; nproc; free -m | head -2; df -h / /mnt 2>/dev/null; cat /etc/os-release | head -3
+          docker version --format '{{.Server.Version}}'
+          docker info --format '{{.Driver}} {{json .DriverStatus}} {{.CgroupVersion}}'
+          docker buildx version; docker buildx ls
+          which zstd unzip jq curl; node --version
+      - name: Snapshot service over http and https
+        run: |
+          for u in http://snapshot.ubuntu.com/ubuntu/$SNAPSHOT/dists/noble/InRelease https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT/dists/noble/InRelease \
+                   https://snapshot.ubuntu.com/ubuntu-ports/$SNAPSHOT/dists/noble/InRelease https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT/dists/noble/main/binary-arm64/Release \
+                   https://snapshot.ubuntu.com/ubuntu-ports/$SNAPSHOT/dists/noble/main/binary-arm64/Release; do
+            echo "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$u") $u"
+          done
+          for u in http://archive.ubuntu.com/ubuntu/dists/noble-updates/InRelease http://ports.ubuntu.com/ubuntu-ports/dists/noble-updates/InRelease; do
+            echo "$u: $(curl -s "$u" | grep -E '^(Origin|Label|Snapshots):' | tr '\n' ' ')"
+          done
+      - name: apt snapshot ways
+        run: image/apt-probe.sh "$UBUNTU" "$SNAPSHOT"
