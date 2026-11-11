@@ -112,7 +112,7 @@ jobs:
       - name: Pins file
         run: |
           pw_exe=$(docker run --rm "$PLAYWRIGHT" sh -c 'ls -d /ms-playwright/chromium_headless_shell-*/chrome-headless-shell-*/chrome-headless-shell')
-          img() { echo "$REPO_IMG/$1@$(jq -r '."containerimage.digest"' "meta/build-$1.json")"; }
+          img() { echo "$REPO_IMG/${1%-*}@$(jq -r '."containerimage.digest"' "meta/build-$1.json")"; }
           jq -n --arg ubuntu "$UBUNTU" --arg pw "$PLAYWRIGHT" --arg pwa "$(cat meta/playwright-amd64.txt)" --arg pwe "$pw_exe" \
             --arg exe /opt/chrome-headless-shell/chrome-headless-shell-linux64/chrome-headless-shell \
             --arg url "https://storage.googleapis.com/chrome-for-testing-public/$CHROMIUM/linux64/chrome-headless-shell-linux64.zip" \
@@ -141,14 +141,19 @@ jobs:
           full=$(jq -r '.images["full-gzip"]' meta/pins.json)
           exe=$(jq -r .ourExe meta/pins.json)
           docker run --rm "$full" sh -c "ldd $exe | grep 'not found' && exit 1 || echo 'ldd: nothing missing'; cat /etc/visual-check/image.json; ls /opt/chrome-headless-shell/*"
-          fonts='fc-list | sort; for f in serif sans-serif monospace cursive fantasy Arial "Times New Roman" "Comic Sans MS" Impact; do echo "fc-match $f: $(fc-match "$f")"; done; dpkg-query -W | grep -iE "font|dejavu" '
-          docker run --rm "$PLAYWRIGHT" sh -c "$fonts" > meta/fc-playwright.txt 2>&1
-          docker run --rm "$full" sh -c "$fonts" > meta/fc-ours.txt 2>&1
-          grep fc-match meta/fc-playwright.txt meta/fc-ours.txt
-          diff <(grep -v '^fc-match' meta/fc-playwright.txt | grep -v 'ii\|^[a-z0-9.+-]*\s' ) <(grep -v '^fc-match' meta/fc-ours.txt | grep -v '^[a-z0-9.+-]*\s') && echo "fc-list: same" || true
-          docker run --rm "$full" dpkg-query -W > meta/dpkg-ours.txt
-          docker run --rm "$PLAYWRIGHT" dpkg-query -W > meta/dpkg-playwright.txt
-          wc -l meta/dpkg-*.txt
+          match='for f in serif sans-serif monospace cursive fantasy Arial "Times New Roman" "Comic Sans MS" Impact; do echo "$f: $(fc-match "$f")"; done'
+          for x in "playwright:$PLAYWRIGHT" "ours:$full"; do
+            n=${x%%:*}; ref=${x#*:}
+            docker run --rm "$ref" sh -c 'fc-list | sort' > "meta/fc-list-$n.txt" 2>&1
+            docker run --rm "$ref" sh -c "$match" > "meta/fc-match-$n.txt" 2>&1
+            docker run --rm "$ref" dpkg-query -W > "meta/dpkg-$n.txt"
+          done
+          paste -d'|' meta/fc-match-playwright.txt meta/fc-match-ours.txt
+          diff meta/fc-list-playwright.txt meta/fc-list-ours.txt && echo "fc-list: same" || true
+          grep -iE 'font|dejavu' meta/dpkg-playwright.txt | sort > meta/dpkg-fonts-playwright.txt
+          grep -iE 'font|dejavu' meta/dpkg-ours.txt | sort > meta/dpkg-fonts-ours.txt
+          diff meta/dpkg-fonts-playwright.txt meta/dpkg-fonts-ours.txt || true
+          wc -l meta/dpkg-*.txt meta/fc-list-*.txt
       - name: Playwright's Chromium arguments and font table
         run: |
           (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
