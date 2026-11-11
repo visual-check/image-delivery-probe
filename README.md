@@ -10,6 +10,8 @@ delivering it, and whether a slim image renders the same pixels as Playwright's 
   records sizes and fonts, and saves cache entries.
 - `.github/workflows/delivery.yml`: time to a runnable browser per delivery option, 8 shards per runner image.
 - `.github/workflows/pixels.yml`: the same 300 stories captured in each image, hashes and pixel deltas compared.
+- `.github/workflows/windows.yml`: Docker Desktop on `windows-2025`: the browser from the image, from a bind mount of a
+  Windows folder, or from a named volume. Time to the first CDP reply, and captures per second.
 
 `harness/` is copied from visual-check's research branch `research/raw-cdp-for-chromium` (MIT, see
 [LICENSE](https://github.com/visual-check/visual-check/blob/main/LICENSE)). Packages and results are throwaway.
