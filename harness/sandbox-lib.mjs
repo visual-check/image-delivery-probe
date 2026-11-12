@@ -37,9 +37,10 @@ export function renderers() {
     // Seccomp 2 is a filter, and two NSpid values mean a PID namespace of its own
     const found = []
     for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
+      // Chromium rewrites its process title, so the command line is one space-separated string
       let cmd
-      try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0') } catch { continue }
-      if (!cmd.includes('--type=renderer') || !(cmd[0]?.includes('chrome-headless-shell') || cmd[0] === '/proc/self/exe')) continue
+      try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ') } catch { continue }
+      if (!cmd.includes('--type=renderer') || !(cmd.includes('chrome-headless-shell') || cmd.startsWith('/proc/self/exe'))) continue
       try {
         const status = readFileSync(`/proc/${pid}/status`, 'utf8')
         const field = (k) => status.match(new RegExp(`^${k}:\\s*(.*)$`, 'm'))?.[1].trim()

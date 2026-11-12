@@ -52,10 +52,12 @@ jobs:
       - name: With the sandbox against without, one pass
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          ( sleep 12; ps -eo pid,args | grep -F -- '--type=' | grep -v grep | cut -c1-220 | head -8 ) > out/ps.txt &
           node harness/sandbox-host.mjs --exe chs/chrome-headless-shell-linux64/chrome-headless-shell --tag userns-allowed \
             --out out --sb sb/storybook-static --passes 1
           jq -c '{label, atS, renderers: [.renderers[] | {seccomp, nspid, ownPidNs, ownUserNs, noNewPrivs, noSandboxFlag}]}' out/renderers.jsonl \
             | tee -a "$GITHUB_STEP_SUMMARY"
+          cat out/ps.txt
       - uses: actions/upload-artifact@v7
         if: always()
         with:
