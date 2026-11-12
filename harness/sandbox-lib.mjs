@@ -33,16 +33,19 @@ export function bench(args, onTick) {
 // Renderer processes of a headless shell started on this machine, and what shows whether each one is sandboxed.
 export function renderers() {
   if (process.platform === 'linux') {
-    const self = readlinkSync('/proc/self/ns/user')
+    // Zygote children run as /proc/self/exe and are made non-dumpable, so only world-readable files are read:
+    // Seccomp 2 is a filter, and two NSpid values mean a PID namespace of its own
     const found = []
     for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
       let cmd
       try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0') } catch { continue }
-      if (!cmd[0]?.includes('chrome-headless-shell') || !cmd.includes('--type=renderer')) continue
+      if (!cmd.includes('--type=renderer') || !(cmd[0]?.includes('chrome-headless-shell') || cmd[0] === '/proc/self/exe')) continue
       try {
         const status = readFileSync(`/proc/${pid}/status`, 'utf8')
-        const field = (k) => status.match(new RegExp(`^${k}:\\s*(\\S+)`, 'm'))?.[1]
-        found.push({ pid: +pid, noSandboxFlag: cmd.includes('--no-sandbox'), seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), uid: field('Uid'), ownUserNs: readlinkSync(`/proc/${pid}/ns/user`) !== self })
+        const field = (k) => status.match(new RegExp(`^${k}:\\s*(.*)$`, 'm'))?.[1].trim()
+        let ownUserNs = null
+        try { ownUserNs = readlinkSync(`/proc/${pid}/ns/user`) !== readlinkSync('/proc/self/ns/user') } catch {}
+        found.push({ pid: +pid, noSandboxFlag: cmd.includes('--no-sandbox'), seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), nspid: field('NSpid'), ownPidNs: (field('NSpid') ?? '').split(/\s+/).length > 1, ownUserNs })
       } catch {}
     }
     return found

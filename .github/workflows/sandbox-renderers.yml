@@ -1,0 +1,64 @@
+# Linux renderer processes with and without Chromium's sandbox on `host` (visual-check#51), with Ubuntu's
+# user-namespace restriction off: a seccomp filter and a PID namespace of their own, read from /proc while capturing.
+name: sandbox-renderers
+
+on:
+  push:
+    branches: [sandbox]
+    paths: ['.github/workflows/sandbox-renderers.yml']
+
+permissions: {}
+
+env:
+  PREPARE_RUN: '43052330326'
+
+jobs:
+  linux:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - name: Unpack, install the harness (JS only) and the headless shell
+        run: |
+          tar -C sb -xf sb/storybook.tar
+          (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
+          mkdir -p out chs
+          curl -fsSL --retry 3 -o chs.zip "$(jq -r .cftUrl meta/pins.json)"
+          unzip -q chs.zip -d chs
+      - name: With the sandbox against without, one pass
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          node harness/sandbox-host.mjs --exe chs/chrome-headless-shell-linux64/chrome-headless-shell --tag userns-allowed \
+            --out out --sb sb/storybook-static --passes 1
+          jq -c '{label, atS, renderers: [.renderers[] | {seccomp, nspid, ownPidNs, ownUserNs, noNewPrivs, noSandboxFlag}]}' out/renderers.jsonl \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sandbox-renderers-${{ matrix.os }}
+          path: out/
+          retention-days: 30

@@ -62,7 +62,7 @@ for (const a of arts) {
   const rs = read(path.join(root, a), 'renderers.jsonl')
   for (const arm of [...new Set(rs.map((r) => r.label.replace(/-p\d+$/, '')))]) {
     const all = rs.filter((r) => r.label.startsWith(`${arm}-p`)).flatMap((r) => r.renderers)
-    const boxed = all.filter((x) => (x.seccomp !== undefined ? x.seccomp === '2' && x.ownUserNs : x.seatbelt !== undefined ? x.seatbelt : !x.noSandboxFlag))
+    const boxed = all.filter((x) => (x.seccomp !== undefined ? x.seccomp === '2' && x.ownPidNs : x.seatbelt !== undefined ? x.seatbelt : !x.noSandboxFlag))
     console.log(`| ${a} | ${arm} | ${rs.filter((r) => r.label.startsWith(`${arm}-p`)).length} | ${all.length} | ${boxed.length} |`)
   }
 }

@@ -10,7 +10,7 @@ name: sandbox
 on:
   push:
     branches: [sandbox]
-    paths-ignore: ['.github/workflows/**']
+    paths-ignore: ['.github/workflows/**', 'harness/**']
   workflow_dispatch:
 
 permissions: {}
