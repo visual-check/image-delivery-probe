@@ -1,0 +1,84 @@
+# Whether Chromium's sandbox can start inside a GitHub job container on the image (visual-check#51): as root, as
+# root with --no-sandbox, and as uid 1000, with Docker's default seccomp profile and with seccomp off.
+name: sandbox-incontainer
+
+on:
+  push:
+    branches: [sandbox]
+    paths: ['.github/workflows/sandbox-incontainer.yml']
+
+permissions: {}
+
+env:
+  PREPARE_RUN: '43052330326'
+
+jobs:
+  pins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    outputs:
+      img: ${{ steps.p.outputs.img }}
+      exe: ${{ steps.p.outputs.exe }}
+      cft: ${{ steps.p.outputs.cft }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - id: p
+        run: |
+          echo "img=$(jq -r '.images["full-gzip"]' meta/pins.json)" >> "$GITHUB_OUTPUT"
+          echo "exe=$(jq -r .ourExe meta/pins.json)" >> "$GITHUB_OUTPUT"
+          echo "cft=$(jq -r .cftUrl meta/pins.json | sed -E 's#/linux64/.*##')" >> "$GITHUB_OUTPUT"
+
+  incontainer:
+    needs: pins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        seccomp: [default, unconfined]
+    container:
+      image: ${{ needs.pins.outputs.img }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: ${{ matrix.seccomp == 'unconfined' && '--security-opt seccomp=unconfined' || '--label vc=default' }}
+    steps:
+      - name: Can the sandbox start in a job container on the image?
+        shell: bash --noprofile --norc {0}
+        run: |
+          exe='${{ needs.pins.outputs.exe }}'
+          mkdir -p out
+          {
+            echo "seccomp: ${{ matrix.seccomp }}"
+            id; grep -E '^(Cap(Prm|Eff|Bnd)|NoNewPrivs|Seccomp):' /proc/self/status
+            attempt() {
+              label=$1; shift
+              s=$(date +%s%N)
+              out=$(timeout 60 "$@" --no-first-run --user-data-dir=/tmp/p-$label --dump-dom about:blank 2> /tmp/err-$label); rc=$?
+              ms=$(( ($(date +%s%N) - s) / 1000000 ))
+              started=false; case "$out" in *'<html'*) [ $rc = 0 ] && started=true ;; esac
+              echo "$label: started=$started exit=$rc ${ms} ms"
+              grep -m2 -E 'FATAL|ERROR|not supported|No usable' /tmp/err-$label || tail -2 /tmp/err-$label
+            }
+            attempt root "$exe"
+            attempt root-no-sandbox "$exe" --no-sandbox
+            attempt uid1000 setpriv --reuid=1000 --regid=1000 --clear-groups "$exe"
+          } 2>&1 | tee out/incontainer.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: sandbox-incontainer-${{ matrix.seccomp }}
+          path: out/
+          retention-days: 30
+

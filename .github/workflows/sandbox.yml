@@ -3,14 +3,14 @@
 #                 no capabilities, no new privileges), both without the sandbox: pixels and speed
 #   host:         headless shell straight on the runner, with Chromium's sandbox against without it. On Linux, first at
 #                 Ubuntu's default setting and as root, then with the user-namespace restriction off
-#   incontainer:  whether the sandbox can start inside a job container on the image, with Docker's default seccomp
-#                 profile and with seccomp off
+#   (job containers on the image: sandbox-incontainer.yml)
 #   docker-desktop: the hardened container through Docker Desktop on Windows
 name: sandbox
 
 on:
   push:
     branches: [sandbox]
+    paths-ignore: ['.github/workflows/**']
   workflow_dispatch:
 
 permissions: {}
@@ -169,53 +169,6 @@ jobs:
           path: out/
           retention-days: 30
 
-  incontainer:
-    needs: pins
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: read
-    strategy:
-      fail-fast: false
-      matrix:
-        seccomp: [default, unconfined]
-    container:
-      image: ${{ needs.pins.outputs.img }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ github.token }}
-      options: ${{ matrix.seccomp == 'unconfined' && '--security-opt seccomp=unconfined' || '--label vc=default' }}
-    steps:
-      - name: Can the sandbox start in a job container on the image?
-        shell: bash
-        run: |
-          exe='${{ needs.pins.outputs.exe }}'
-          mkdir -p out
-          {
-            echo "seccomp: ${{ matrix.seccomp }}"
-            id; grep -E '^(Cap(Prm|Eff|Bnd)|NoNewPrivs|Seccomp):' /proc/self/status
-            attempt() {
-              label=$1; shift
-              s=$(date +%s%N)
-              out=$(timeout 60 "$@" --no-first-run --user-data-dir=/tmp/p-$label --dump-dom about:blank 2> /tmp/err-$label); rc=$?
-              ms=$(( ($(date +%s%N) - s) / 1000000 ))
-              started=false; case "$out" in *'<html'*) [ $rc = 0 ] && started=true ;; esac
-              echo "$label: started=$started exit=$rc ${ms} ms"
-              grep -m2 -E 'FATAL|ERROR|not supported|No usable' /tmp/err-$label || tail -2 /tmp/err-$label
-            }
-            attempt root "$exe"
-            attempt root-no-sandbox "$exe" --no-sandbox
-            attempt uid1000 setpriv --reuid=1000 --regid=1000 --clear-groups "$exe"
-          } 2>&1 | tee out/incontainer.txt
-      - uses: actions/upload-artifact@v7
-        if: always()
-        continue-on-error: true
-        with:
-          name: sandbox-incontainer-${{ matrix.seccomp }}
-          path: out/
-          retention-days: 30
-
   docker-desktop:
     runs-on: windows-2025
     timeout-minutes: 90
@@ -274,7 +227,7 @@ jobs:
           retention-days: 30
 
   summary:
-    needs: [container, host, incontainer, docker-desktop]
+    needs: [container, host, docker-desktop]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
