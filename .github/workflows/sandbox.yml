@@ -1,0 +1,292 @@
+# Chromium's sandbox for visual-check#51:
+#   container:    visual-check's own container as today (root, default capabilities) against hardened (non-root user,
+#                 no capabilities, no new privileges), both without the sandbox: pixels and speed
+#   host:         headless shell straight on the runner, with Chromium's sandbox against without it. On Linux, first at
+#                 Ubuntu's default setting and as root, then with the user-namespace restriction off
+#   incontainer:  whether the sandbox can start inside a job container on the image, with Docker's default seccomp
+#                 profile and with seccomp off
+#   docker-desktop: the hardened container through Docker Desktop on Windows
+name: sandbox
+
+on:
+  push:
+    branches: [sandbox]
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  PREPARE_RUN: '43052330326'
+
+jobs:
+  pins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    outputs:
+      img: ${{ steps.p.outputs.img }}
+      exe: ${{ steps.p.outputs.exe }}
+      cft: ${{ steps.p.outputs.cft }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - id: p
+        run: |
+          echo "img=$(jq -r '.images["full-gzip"]' meta/pins.json)" >> "$GITHUB_OUTPUT"
+          echo "exe=$(jq -r .ourExe meta/pins.json)" >> "$GITHUB_OUTPUT"
+          echo "cft=$(jq -r .cftUrl meta/pins.json | sed -E 's#/linux64/.*##')" >> "$GITHUB_OUTPUT"
+
+  container:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+        job: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - name: Unpack, install the harness (JS only) and pull the image
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          (cd sb && sha256sum -c storybook.tar.sha256) && tar -C sb -xf sb/storybook.tar
+          (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
+          img=$(jq -r '.images["full-gzip"]' meta/pins.json)
+          docker pull -q "$img" || { echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin && docker pull -q "$img"; }
+      - name: Today against hardened
+        run: |
+          { nproc; lscpu | grep -E 'Model name'; free -m | head -2; } | tee machine.txt
+          node harness/sandbox-container.mjs --tag ${{ matrix.os }} --net host --out out --sb sb/storybook-static \
+            --rot $(( ${{ matrix.job }} - 1 )) --passes 3
+          mv machine.txt out/
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sandbox-container-${{ matrix.os }}-job${{ matrix.job }}
+          path: out/
+          retention-days: 30
+
+  host:
+    needs: pins
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04, macos-latest, windows-2025]
+        job: [1, 2, 3]
+        include:
+          - { os: ubuntu-24.04, cft: linux64 }
+          - { os: ubuntu-26.04, cft: linux64 }
+          - { os: macos-latest, cft: mac-arm64 }
+          - { os: windows-2025, cft: win64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - name: Unpack and install the harness (JS only)
+        run: |
+          tar -C sb -xf sb/storybook.tar
+          (cd harness && npm ci --ignore-scripts --no-audit --no-fund)
+          mkdir -p out chs
+          curl -fsSL --retry 3 -o chs.zip "${{ needs.pins.outputs.cft }}/${{ matrix.cft }}/chrome-headless-shell-${{ matrix.cft }}.zip"
+      - name: Unzip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: tar.exe -xf chs.zip -C chs
+      - name: Unzip
+        if: runner.os != 'Windows'
+        run: unzip -q chs.zip -d chs
+      - name: Linux at Ubuntu's default setting, and as root
+        if: runner.os == 'Linux'
+        run: |
+          exe=chs/chrome-headless-shell-linux64/chrome-headless-shell
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.apparmor_restrict_unprivileged_unconfined kernel.unprivileged_userns_clone user.max_user_namespaces 2>&1 | tee out/sysctl.txt || true
+          node harness/sandbox-host.mjs --exe "$exe" --tag default --out out --probe-only
+          sudo env "PATH=$PATH" node harness/sandbox-host.mjs --exe "$exe" --tag root --out out --probe-only
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: With the sandbox against without
+        run: |
+          case "${{ matrix.cft }}" in
+            linux64) exe=chs/chrome-headless-shell-linux64/chrome-headless-shell; tag=userns-allowed ;;
+            mac-arm64) exe=chs/chrome-headless-shell-mac-arm64/chrome-headless-shell; tag=default ;;
+            win64) exe=chs/chrome-headless-shell-win64/chrome-headless-shell.exe; tag=default ;;
+          esac
+          node harness/sandbox-host.mjs --exe "$exe" --tag "$tag" --out out --sb sb/storybook-static \
+            --rot $(( ${{ matrix.job }} - 1 )) --passes 3
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sandbox-host-${{ matrix.os }}-job${{ matrix.job }}
+          path: out/
+          retention-days: 30
+
+  incontainer:
+    needs: pins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        seccomp: [default, unconfined]
+    container:
+      image: ${{ needs.pins.outputs.img }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: ${{ matrix.seccomp == 'unconfined' && '--security-opt seccomp=unconfined' || '--label vc=default' }}
+    steps:
+      - name: Can the sandbox start in a job container on the image?
+        shell: bash
+        run: |
+          exe='${{ needs.pins.outputs.exe }}'
+          mkdir -p out
+          {
+            echo "seccomp: ${{ matrix.seccomp }}"
+            id; grep -E '^(Cap(Prm|Eff|Bnd)|NoNewPrivs|Seccomp):' /proc/self/status
+            attempt() {
+              label=$1; shift
+              s=$(date +%s%N)
+              out=$(timeout 60 "$@" --no-first-run --user-data-dir=/tmp/p-$label --dump-dom about:blank 2> /tmp/err-$label); rc=$?
+              ms=$(( ($(date +%s%N) - s) / 1000000 ))
+              started=false; case "$out" in *'<html'*) [ $rc = 0 ] && started=true ;; esac
+              echo "$label: started=$started exit=$rc ${ms} ms"
+              grep -m2 -E 'FATAL|ERROR|not supported|No usable' /tmp/err-$label || tail -2 /tmp/err-$label
+            }
+            attempt root "$exe"
+            attempt root-no-sandbox "$exe" --no-sandbox
+            attempt uid1000 setpriv --reuid=1000 --regid=1000 --clear-groups "$exe"
+          } 2>&1 | tee out/incontainer.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: sandbox-incontainer-${{ matrix.seccomp }}
+          path: out/
+          retention-days: 30
+
+  docker-desktop:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: storybook
+          path: sb
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: meta
+          path: meta
+          run-id: ${{ env.PREPARE_RUN }}
+          github-token: ${{ github.token }}
+      - name: Unpack and install the harness (JS only)
+        run: |
+          tar -C sb -xf sb/storybook.tar
+          Push-Location harness; npm ci --ignore-scripts --no-audit --no-fund; Pop-Location
+          New-Item -ItemType Directory -Force out | Out-Null
+      - name: Docker Desktop
+        timeout-minutes: 30
+        run: harness/docker-desktop-windows.ps1 *>&1 | Tee-Object out/docker-desktop.txt
+      - name: Today against hardened, through the proxy
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          $cli = 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
+          $pins = Get-Content meta/pins.json | ConvertFrom-Json
+          & $cli --context desktop-linux pull -q $pins.images.'full-gzip'
+          if ($LASTEXITCODE) {
+            $env:TOKEN | & $cli --context desktop-linux login ghcr.io -u $env:GITHUB_ACTOR --password-stdin
+            & $cli --context desktop-linux pull -q $pins.images.'full-gzip'
+          }
+          $docker = ConvertTo-Json -Compress @($cli, '--context', 'desktop-linux')
+          node harness/sandbox-container.mjs --docker $docker --net proxy --tag docker-desktop --out out --sb sb/storybook-static --passes 2
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sandbox-docker-desktop-job1
+          path: out/
+          retention-days: 30
+
+  summary:
+    needs: [container, host, incontainer, docker-desktop]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sandbox-*
+          path: art
+      - name: Summarise
+        run: node harness/sandbox-summary.mjs art | tee -a "$GITHUB_STEP_SUMMARY"
